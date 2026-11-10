@@ -1,0 +1,284 @@
+# agent-hooks
+
+> Status: Beta. Spec: the SDKs support two specification versions,
+> [0.1](spec/0.1/AGENT-HOOKS-0.1.md), the released specification, wire
+> string `agent-hooks/0.1`, and the [draft](spec/draft/AGENT-HOOKS-DRAFT.md),
+> wire string `agent-hooks/draft`, which changes without notice and is
+> never claimed. A host names the version it emits; there is no default.
+> Host declaration contract: `agent-hooks-declaration/1.1` under the draft,
+> `1.0` under 0.1 ([version table](spec/draft/DECLARATION-VERSIONS.md)).
+
+Agent Hooks is the interception contract between an agent host and the
+controls that govern it. It fixes eight points in the agent loop, the
+context the host hands over at each, the verdict a control returns, and
+what the host must do with that verdict. Any host (a framework, a
+runtime, a gateway) can expose the contract, and any control (a policy
+engine, a content filter, a rate limiter, an approval gateway, an egress
+guard) can target it. Agent Hooks is not a policy engine: it carries no
+rules and makes no decisions of its own. It is not a sandbox: the host
+is trusted, interceptors run in-process with full data access, and the
+eight points do not promise complete mediation. It is a control plane,
+not a telemetry plane: every verdict binds the host, and passive
+observation is out of scope. See [SECURITY.md](SECURITY.md) and
+[spec §1.4](spec/0.1/AGENT-HOOKS-0.1.md#14-trust-model-and-non-goals).
+
+## Points and verdicts
+
+| Interception point | When | Target a `transform` may rewrite |
+| --- | --- | --- |
+| `agent_startup` | Once, before the first input of a session | none |
+| `input` | Each external request entering the session | `input` |
+| `pre_model_call` | Before each model request | `messages` |
+| `post_model_call` | After each model response | `response` |
+| `pre_tool_call` | Before each tool invocation | `tool_call.args` |
+| `post_tool_call` | After each tool invocation | `tool_result.value` |
+| `output` | Before the final response leaves | `output` |
+| `agent_shutdown` | Once, at the end of the session | none |
+
+| Verdict | Host obligation |
+| --- | --- |
+| `allow` | Proceed. Record any warnings the verdict carries. |
+| `transform` | Apply the rewrite to the target, then proceed with the new value. |
+| `deny` | Do not proceed. A deny that carries an `approval` block is liftable through the approval seam (§9); until lifted it is a deny. |
+
+Warnings ride on any verdict. A host that cannot build a valid context,
+or whose interceptor raises, times out or returns an invalid verdict,
+denies with a reserved `host_error:*` reason (§6.3, §11). Zero
+registered interceptors in `enforce` mode denies too (§7). An
+administrator can mark one binding best effort with
+`on_error: continue` (§6.3.1): the three interceptor failures then
+substitute an allow that carries `host_warning:control_failed`, the
+record keeps the cause in `substituted_for`, and the host tells the
+principal. The default is `deny` everywhere and nothing else has a
+knob.
+
+The decided [P-006](docs/proposals/P-006-interceptor-response-envelope.md)
+adds an optional response envelope for hosted transports:
+
+```json
+{ "verdict": { "decision": "allow" }, "extensions": { "provider": { "receipt": {} } } }
+```
+
+`Verdict` remains closed. The SDKs carry an interceptor-response parser that
+accepts either a bare Verdict or this envelope; only the nested Verdict participates in
+enforcement. The envelope is part of the 0.1 contract.
+
+## Adopting it as a host
+
+A host builds one emitter, registers interceptors with it, and emits a
+context at each point. There are three ways to build the emitter, and
+they produce the same emitter and the same records:
+
+1. From a host declaration file.
+2. From the declaration as JSON text or a parsed value.
+3. In code, through a declaration builder; its value goes through the
+   same loader.
+
+The constructor and setters still work and stay conformant. That path
+carries no declaration, is not sealed, and its records are unchanged.
+
+The host declaration (spec §7.7) is one JSON document that states the
+host's configuration, its declared surface and its interceptor
+bindings. It is a versioned contract of its own, separate from the wire
+version and from package versions: 0.1 defines
+`agent-hooks-declaration/1.0`, and the SDKs also accept the draft's 1.1,
+which adds the failure posture. The document names the specification
+version it is written for in `spec` (`agent-hooks/0.1` or
+`agent-hooks/draft`); the SDKs require that member under both
+versions, so a document written for 0.1 without it is refused and
+needs that one line added. Enterprise settings channels can carry it
+unchanged.
+
+```json
+{
+  "$schema": "https://responsibleai.github.io/agent-hooks/schema/v0.1/host-declaration-1.0.schema.json",
+  "declaration": "agent-hooks-declaration/1.0",
+  "spec": "agent-hooks/0.1",
+  "id": "prod-eu-strict",
+  "host": { "name": "example-runtime", "version": "3.2.0" },
+  "configuration": {
+    "mode": "enforce",
+    "composition": { "profile": "parallel/unanimous", "on_disagreement": "approval" },
+    "identity_provider": "jcs-sha256",
+    "approval": { "resolver": "operator-queue", "redactor": "strip-secrets" },
+    "posture": { "tool_seam_host_error": "continue" },
+    "timeouts": { "interceptor_ms": 5000, "approval_resolver_ms": 30000 },
+    "records": { "max_buffered": 10000 }
+  },
+  "surface": {
+    "interception_points": [
+      "agent_startup", "input", "pre_model_call", "post_model_call",
+      "pre_tool_call", "post_tool_call", "output", "agent_shutdown"
+    ],
+    "capabilities": ["model_calls", "tool_calls", "int64_json", "host_declaration"],
+    "profiles": {
+      "sequential/first_deny": { "on_approval": ["stop", "resume"] },
+      "sequential/run_all": {},
+      "parallel/strictest": { "on_transform_conflict": ["deny", "approval"] },
+      "parallel/unanimous": { "on_disagreement": ["deny", "approval"] }
+    },
+    "buffered_output": true,
+    "declaration_versions": ["agent-hooks-declaration/1.0", "agent-hooks-declaration/1.1"]
+  },
+  "bindings": [
+    {
+      "id": "egress-guard",
+      "kind": "com.example.egress",
+      "at": ["pre_tool_call", "output"],
+      "config": { "allow_hosts": ["internal.example"] },
+      "timeout_ms": 2000
+    },
+    { "id": "audit", "kind": "com.example.audit-log", "config": { "sink": "stdout" } }
+  ]
+}
+```
+
+Only `declaration` and `bindings` are required. Every other member
+defaults to the value the spec already names, and every default fails
+closed. A binding is a `kind` plus a kind-specific `config`. The kind
+is a lookup key the host controls; the spec defines no kinds and names
+no product. The host registers a resolver per kind in code, along with
+any custom identity provider, approval resolver or redactor the
+document may name, and the surface its code supports:
+
+```python
+from agent_hooks import HostRegistry, HostSurface, InterceptionEmitter
+
+registry = (
+    HostRegistry(
+        HostSurface.from_capabilities(
+            ["model_calls", "tool_calls", "int64_json", "host_declaration"]
+        )
+    )
+    .kind("com.example.egress", lambda config, ctx: EgressGuard(**config))
+    .kind("com.example.audit-log", lambda config, ctx: AuditLog(**config))
+    .approval_resolver("operator-queue", OperatorQueue())
+    .approval_redactor("strip-secrets", strip_secrets)
+)
+emitter = InterceptionEmitter.from_declaration_path("agent-hooks.declaration.json", registry)
+```
+
+A document that names a point, profile, capability, provider or kind
+the code cannot honour is refused at load, before any emission, with
+one of eleven `declaration_error:*` classes
+([`spec/0.1/declaration-errors.json`](spec/0.1/declaration-errors.json)).
+Nothing is narrowed or applied in part. A loader refuses a version it
+does not accept and names the versions it does. Once built, the emitter
+is sealed, and every record it writes carries the contract version.
+The per-SDK READMEs show the same calls in each language.
+
+## Composition and seams
+
+- Composition profile (§7): `sequential/first_deny` (default),
+  `sequential/run_all`, `parallel/strictest`, `parallel/unanimous`,
+  each with the knobs it consults. The profile in effect is stamped on
+  every record.
+- Approval seam (§9): a liftable deny consults the host's registered
+  resolver; the resolution echoes the context identity, so an approval
+  binds to the content the approver saw. No resolver means the deny
+  stands.
+- Redaction seam (§9): a registered redactor shapes what the approver
+  sees; the identity is computed over the redacted context.
+- Identity provider (§10.1): `jcs-sha256` by default, a named custom
+  provider, or `null` for identity-unbound records.
+- Interception record (§10.3): payload-free by construction, one per
+  emission, with the verdict projection, identities, composition and
+  the declaration version when a declaration built the emitter.
+- Enforcement mode (§8): `enforce`, or `evaluate_only` for records
+  without effect.
+
+A decision runtime behind an interceptor (a policy engine the
+interceptor calls) reports its own failures as ordinary denies under
+its own reason namespace, by convention `runtime_error:<code>`. It
+never uses `host_error:*`: §11 reserves that namespace for verdicts the
+host synthesizes, and §5 validation rejects it from an interceptor.
+
+Everything normative runs once, in the Rust core. The Python,
+TypeScript, .NET and Go SDKs bind it and own only dispatch into host
+code, timeouts and runtime integration. Golden files pin
+byte-identical canonical JSON, context identities and resolved
+declarations across the five.
+
+## Conformance
+
+The Conformance Test Kit under [`conformance/`](conformance/) is the
+test. A host implements the `Harness` interface in one SDK
+([`conformance/HARNESS.md`](conformance/HARNESS.md)), declares its
+surface (points, capabilities, profiles and knob values, identity
+provider, posture), and passes every vector that applies to that
+surface. There are no tiers. The report lists what ran, per part. A
+host may present its surface as a host declaration document, and a
+claim may cite that file. Claims live in
+[`conformance/CLAIMS.md`](conformance/CLAIMS.md). A conformance claim
+is not a security certification. The gating tests run the released
+vectors under 0.1, the newest released version; the 17 draft-only
+vectors, the working test set for the next version, and the tests that
+read draft-only files run in an advisory job. A claim names a released
+version, and every runner refuses a report that names the draft.
+Binding tests to a draft revision is #188.
+
+## Install
+
+| SDK | Install |
+| --- | --- |
+| Rust | `cargo add agent-hooks-sdk` |
+| Python | `pip install --pre agent-hooks-sdk` |
+| TypeScript | `npm install @responsibleai/agent-hooks` |
+| .NET | `dotnet add package ResponsibleAI.AgentHooks --prerelease` |
+| Go | `go get github.com/responsibleai/agent-hooks/sdk/go/agenthooks` |
+
+A plain `npm install` gets the newest release, pre-releases included.
+The channel tags `alpha`, `beta` and `rc` exist for pinning to one
+line, for example `@responsibleai/agent-hooks@beta`; or pin an exact
+version. See [RELEASING.md](RELEASING.md).
+
+The spec is versioned `MAJOR.MINOR`, the declaration contract
+`MAJOR.MINOR`, and the packages by semver, each on its own axis. Every
+SDK supports two specification versions, 0.1 and the draft, and exports
+their wire strings and the supported set: `SPEC_VERSION_0_1`,
+`SPEC_VERSION_DRAFT` and `SUPPORTED_SPEC_VERSIONS` (`["0.1", "draft"]`)
+in Rust, Python and TypeScript; `SpecVersion01`, `SpecVersionDraft` and
+`SupportedSpecVersions` in Go; `Spec.V01`, `Spec.Draft` and
+`Spec.SupportedVersions` in .NET; beside the current declaration version
+and the accepted set (`DECLARATION_VERSION` and
+`SUPPORTED_DECLARATION_VERSIONS`, `DeclarationVersion` and
+`SupportedDeclarationVersions`, `Declaration.Version` and
+`Declaration.SupportedVersions`). A host names the version when it
+builds its emitter and its context builder, or in its host
+declaration's `spec` member; there is no default, and an emitter
+refuses a context of another version. The version named selects the
+rules: `host_warning:*` is reserved, declaration 1.1 is accepted and
+`on_error: continue` exists under the draft only. The draft is never
+claimed. See [VERSIONING.md](VERSIONING.md) and
+[spec/draft/DECLARATION-VERSIONS.md](spec/draft/DECLARATION-VERSIONS.md).
+
+## Read next
+
+- [`spec/README.md`](spec/README.md): specification versions. The
+  released specification is 0.1,
+  [`spec/0.1/AGENT-HOOKS-0.1.md`](spec/0.1/AGENT-HOOKS-0.1.md), the text
+  the SDKs shipped against at `v0.1.0-beta.3`. The draft,
+  [`spec/draft/AGENT-HOOKS-DRAFT.md`](spec/draft/AGENT-HOOKS-DRAFT.md), is
+  the working text and the version `draft` (`agent-hooks/draft`); its
+  [`schema/`](spec/draft/schema/) separates the
+  TypeScript source from the generated JSON Schemas in
+  [`generated/`](spec/draft/schema/generated/).
+- [`docs/IMPLEMENTING.md`](docs/IMPLEMENTING.md): what it means to
+  implement Agent Hooks in a harness or gateway.
+- [`conformance/HARNESS.md`](conformance/HARNESS.md): how to write a
+  harness and run the CTK.
+- [`docs/PRODUCTION.md`](docs/PRODUCTION.md) and
+  [`docs/OPERATIONS.md`](docs/OPERATIONS.md): the decisions to make
+  before production and the runbook after.
+- [`docs/THREAT-MODEL.md`](docs/THREAT-MODEL.md),
+  [`docs/CONTROLS-MAPPING.md`](docs/CONTROLS-MAPPING.md),
+  [`docs/INTEROP.md`](docs/INTEROP.md): threats and mitigations,
+  OWASP and NIST mapping, MCP and A2A interop.
+- [`docs/proposals/`](docs/proposals/): design proposals and the
+  process in [`docs/proposals/README.md`](docs/proposals/README.md).
+- [`GOVERNANCE.md`](GOVERNANCE.md), [`CONTRIBUTING.md`](CONTRIBUTING.md),
+  [`CHANGELOG.md`](CHANGELOG.md).
+
+## License
+
+MIT. See [`LICENSE`](LICENSE).

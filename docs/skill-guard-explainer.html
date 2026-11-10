@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How we added the skill-load guard to agent-hooks</title>
+<style>
+  :root {
+    --bg: #fbfbfa; --fg: #1d1d1f; --muted: #5f6368; --card: #ffffff; --line: #e3e3e0;
+    --accent: #2b5fd9; --accent-soft: #e8eefc; --ok: #1e7f4f; --ok-soft: #e4f4ea;
+    --bad: #b3261e; --bad-soft: #fbe9e7; --warn: #8a5a00; --warn-soft: #fff3d6;
+    --skip: #9aa0a6; --code-bg: #f3f3f1;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #141416; --fg: #e8e8ea; --muted: #a0a4ab; --card: #1d1e21; --line: #2e3034;
+      --accent: #7ea2ff; --accent-soft: #1f2a44; --ok: #5cc98d; --ok-soft: #173326;
+      --bad: #ff8a80; --bad-soft: #3a1c1a; --warn: #f2c25c; --warn-soft: #3a2e12;
+      --skip: #5f6368; --code-bg: #232428;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  main { max-width: 920px; margin: 0 auto; padding: 40px 24px 80px; }
+  h1 { font-size: 30px; line-height: 1.25; margin: 0 0 8px; }
+  h2 { font-size: 22px; margin: 48px 0 12px; padding-top: 8px; border-top: 1px solid var(--line); }
+  h3 { font-size: 17px; margin: 24px 0 8px; }
+  p { margin: 8px 0 12px; }
+  .lede { color: var(--muted); font-size: 18px; margin-bottom: 24px; }
+  code { font: 13.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+         background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+  pre { background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px;
+        padding: 14px 16px; overflow-x: auto; margin: 10px 0 16px; }
+  pre code { background: none; padding: 0; font-size: 13px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; margin: 12px 0; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (max-width: 720px) { .grid2 { grid-template-columns: 1fr; } }
+  .tag { display: inline-block; font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 999px; margin-right: 6px; }
+  .tag.ok { background: var(--ok-soft); color: var(--ok); }
+  .tag.bad { background: var(--bad-soft); color: var(--bad); }
+  .tag.warn { background: var(--warn-soft); color: var(--warn); }
+  .tag.info { background: var(--accent-soft); color: var(--accent); }
+  table { width: 100%; border-collapse: collapse; margin: 10px 0 16px; font-size: 14.5px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-size: 13px; color: var(--muted); font-weight: 600; }
+  .tldr { background: var(--accent-soft); border-left: 4px solid var(--accent); border-radius: 6px; padding: 14px 18px; }
+  .tldr ul { margin: 6px 0 0; padding-left: 20px; }
+
+  /* Flow diagram */
+  .scenarios { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0 16px; }
+  .scenarios button { font: inherit; font-size: 14px; padding: 6px 12px; border-radius: 999px; cursor: pointer;
+                      border: 1px solid var(--line); background: var(--card); color: var(--fg); }
+  .scenarios button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .flow { list-style: none; margin: 0; padding: 0; }
+  .step { position: relative; display: grid; grid-template-columns: 34px 1fr auto; gap: 12px; align-items: center;
+          background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; margin: 0 0 18px;
+          transition: opacity .2s, border-color .2s, background .2s; }
+  .step:not(:last-child)::after { content: ""; position: absolute; left: 30px; bottom: -18px; width: 2px; height: 18px; background: var(--line); }
+  .step .num { width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center; font-weight: 700; font-size: 14px;
+               background: var(--accent-soft); color: var(--accent); }
+  .step .what b { display: block; }
+  .step .what span { color: var(--muted); font-size: 14px; }
+  .step .state { font-size: 12px; font-weight: 700; padding: 3px 10px; border-radius: 999px; white-space: nowrap; }
+  .step.gate { border-width: 2px; border-color: var(--accent); }
+  .step.run .state { background: var(--ok-soft); color: var(--ok); }
+  .step.deny { border-color: var(--bad); background: var(--bad-soft); }
+  .step.deny .state { background: var(--bad); color: #fff; }
+  .step.lift .state { background: var(--warn-soft); color: var(--warn); }
+  .step.skip { opacity: .42; }
+  .step.skip .state { background: transparent; color: var(--skip); border: 1px dashed var(--skip); }
+  .outcome { margin-top: 4px; padding: 12px 16px; border-radius: 8px; font-weight: 600; }
+  .outcome.ok { background: var(--ok-soft); color: var(--ok); }
+  .outcome.bad { background: var(--bad-soft); color: var(--bad); }
+  .muted { color: var(--muted); }
+  footer { margin-top: 56px; color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<main>
+
+<h1>How we added the skill-load guard</h1>
+<p class="lede">The task was to run checks on every skill an agent loads, using agent-hooks' existing hook contract and without changing the spec. This page explains what we built, why it's shaped this way, and how we tested it.</p>
+
+<div class="tldr">
+  <b>In one paragraph:</b> agent-hooks has 8 fixed checkpoints, and a host may not invent a ninth. So we didn't add a "skill load" checkpoint. Instead, the host loads every skill through one function, <code>load_skill</code>, which it reports as a tool call. That puts every skill load between two checkpoints that already exist: <code>pre_tool_call</code> (before the skill is read) and <code>post_tool_call</code> (after it's read, before the agent sees it). A new binding kind, <code>com.example.skill-guard</code>, sits at those two checkpoints and returns allow or deny.
+  <ul>
+    <li>The spec, the Rust core and the SDK APIs are unchanged.</li>
+    <li>It works on the released spec version 0.1.</li>
+    <li>We added three things: a docs page, one nav line, and a test file that runs the docs page's code.</li>
+    <li>A subagent code review and an end-to-end run then found 12 issues, several of which let a skill through. Section 7 lists them and how each was fixed.</li>
+  </ul>
+</div>
+
+<h2>1. The problem and the constraint</h2>
+<p>A <b>skill</b> is a packaged set of instructions (often a <code>SKILL.md</code> file) that an agent pulls into its context when it needs it. That makes it a way in for untrusted instructions. We want a gate that can block a skill based on <em>which</em> skill it is, <em>where</em> it came from, and <em>what</em> it contains.</p>
+<div class="grid2">
+  <div class="card">
+    <span class="tag bad">Rejected</span> <b>Add a new <code>skill_load</code> checkpoint</b>
+    <p>The spec says (§3): <i>"The set is closed; a host MUST NOT emit an AgentContext whose interception_point is not one of these values."</i> A ninth checkpoint would mean changing:</p>
+    <ul>
+      <li>the spec;</li>
+      <li>the schemas;</li>
+      <li>all five SDKs;</li>
+      <li>the conformance vectors;</li>
+      <li>the declaration format.</li>
+    </ul>
+    <p>That is a large change.</p>
+  </div>
+  <div class="card">
+    <span class="tag ok">Chosen</span> <b>Treat a skill load as a tool call</b>
+    <p><code>docs/INTEROP.md</code> already uses this approach for MCP resource reads: things that aren't tool calls get covered by presenting them as tools. A tool call gets a <i>before</i> checkpoint and an <i>after</i> checkpoint, which are exactly the two gates we need. Nothing in the contract changes.</p>
+  </div>
+</div>
+
+<h2>2. Walk through a skill load</h2>
+<p>Pick a scenario to see which steps run, where it stops, and why. The two outlined steps are the guard's two gates.</p>
+
+<div class="scenarios" role="group" aria-label="Scenario">
+  <button type="button" data-s="reviewed" aria-pressed="true">Reviewed skill</button>
+  <button type="button" data-s="blocked">Blocklisted skill</button>
+  <button type="button" data-s="unreviewed">Unreviewed, no approver</button>
+  <button type="button" data-s="approved">Unreviewed, approver says yes</button>
+  <button type="button" data-s="tampered">Content was tampered</button>
+  <button type="button" data-s="rewrite">Approver rewrites the name</button>
+  <button type="button" data-s="crash">The guard crashes</button>
+</div>
+
+<ol class="flow" id="flow">
+  <li class="step" data-k="ask"><div class="num">1</div><div class="what"><b>Agent asks for a skill</b><span>The model, a user command, or the host itself wants e.g. <code>pdf-tools</code>.</span></div><div class="state"></div></li>
+  <li class="step" data-k="pre"><div class="num">2</div><div class="what"><b><code>load_skill</code> emits <code>pre_tool_call</code></b><span>Tool name <code>load_skill</code>; args <code>{name, source, version}</code>, which are covered by the fingerprint.</span></div><div class="state"></div></li>
+  <li class="step gate" data-k="g1"><div class="num">3</div><div class="what"><b>Guard, gate 1: which skill and where from</b><span>Valid name → blocklist → trusted source → reviewed (allowlist).</span></div><div class="state"></div></li>
+  <li class="step" data-k="appr"><div class="num">4</div><div class="what"><b>Approver (only for "unreviewed")</b><span>A deny that a human approver can lift. With no approver registered, it stays a deny.</span></div><div class="state"></div></li>
+  <li class="step" data-k="read"><div class="num">5</div><div class="what"><b>Host reads the skill</b><span>Only after gate 1 allows. Any read error still emits step 6, as an error result.</span></div><div class="state"></div></li>
+  <li class="step" data-k="post"><div class="num">6</div><div class="what"><b><code>load_skill</code> emits <code>post_tool_call</code></b><span>The skill text is the result value, which is covered by the fingerprint.</span></div><div class="state"></div></li>
+  <li class="step gate" data-k="g2"><div class="num">7</div><div class="what"><b>Guard, gate 2: what the skill contains</b><span>Re-check name and source → is text → size limit → pinned SHA-256 → forbidden patterns.</span></div><div class="state"></div></li>
+  <li class="step" data-k="use"><div class="num">8</div><div class="what"><b>Skill enters the agent's context</b><span>This is the only way in. A deny at step 7 means the host throws the text away.</span></div><div class="state"></div></li>
+</ol>
+<div class="outcome ok" id="outcome"></div>
+
+<h2>3. The pieces we wrote</h2>
+<p>Everything lives in one new docs page, <code>docs-site/docs/examples/skill-guard.md</code>. It follows the same pattern as every other control in the repo: <b>binding → kind resolver → interceptor → verdict</b>.</p>
+
+<h3>3a. The binding (in the host's declaration file)</h3>
+<p>A binding says <i>what to call</i> (the <code>kind</code>), <i>where</i> (<code>at</code>), and <i>with what settings</i> (<code>config</code>). The <code>kind</code> is just a name; the host's own code decides what it means.</p>
+<pre><code>{
+  "id": "skill-guard",
+  "kind": "com.example.skill-guard",
+  "at": ["pre_tool_call", "post_tool_call"],
+  "timeout_ms": 2000,
+  "config": {
+    "trusted_sources": ["internal-registry"],
+    "allow": { "pdf-tools": "sha256:c01c…a078", "sql-helper": null },
+    "block": ["shell-anything"],
+    "max_bytes": 262144,
+    "forbidden_patterns": ["curl | sh", "ignore previous instructions"]
+  }
+}</code></pre>
+<p class="muted">The <code>allow</code> map pins each reviewed skill to the SHA-256 of its content. <code>null</code> means "any content that passes the other checks". The page also binds an explicit allow-all at the other checkpoints (including the two model ones, since an agent that loads skills calls a model), because in enforce mode a checkpoint with nothing bound denies everything (<code>host_error:no_interceptor</code>).</p>
+
+<h3>3b. The kind resolver: runs once, when the file loads</h3>
+<p>The host registers <code>resolve_skill_guard</code> under the kind name. When the declaration loads, the SDK calls it with the binding's config. It checks every key and refuses anything it doesn't understand. A refusal rejects the <i>whole</i> file (<code>declaration_error:binding_rejected</code>) before any agent runs, and its error message names keys, never values, because config can contain secrets. It also refuses any binding that is not on exactly both tool checkpoints: bound at only one, half the guard would silently do nothing.</p>
+<pre><code>registry = (
+    HostRegistry(HostSurface.from_capabilities(["model_calls", "tool_calls", "host_declaration"]))
+    .kind("com.example.skill-guard", resolve_skill_guard)
+    .kind("com.example.allow-all", lambda config, binding: AllowAll())
+    .approval_resolver("skill-review", SkillReviewQueue())
+)
+emitter = InterceptionEmitter.from_declaration_path("agent-hooks.declaration.json", registry)</code></pre>
+
+<h3>3c. The interceptor: <code>SkillGuard.intercept</code></h3>
+<p>It is called at every <code>pre_tool_call</code> and <code>post_tool_call</code>. It ignores (allows) every tool that isn't <code>load_skill</code>, so normal tool calls are unaffected. The checks run in a worker thread (<code>asyncio.to_thread</code>). The SDK's timeout can only interrupt an interceptor at an <code>await</code>, so a body that never awaited would run to the end however long it took.</p>
+<pre><code>async def intercept(self, ctx):
+    return await asyncio.to_thread(self._check, ctx)    # so the timeout can fire
+
+def _check(self, ctx):
+    call = ctx.get("tool_call") or {}
+    if call.get("name") != LOADER_TOOL:
+        return Verdict.allow()                          # not a skill load
+    args = call["args"]
+    denied = self._screen(args)         # name slug, blocklist, trusted source: BOTH points
+    if denied is not None:
+        return denied
+    if ctx["interception_point"] == "pre_tool_call":
+        # not on the allowlist -> a deny an approver may lift; else allow
+        return Verdict.escalate(...) if args["name"] not in self._allow else Verdict.allow()
+    return self._after_load(args, ctx["tool_result"])   # gate 2: content</code></pre>
+
+<h3>3d. The host gateway: <code>load_skill</code></h3>
+<p>This is the single route every skill takes into the agent. It always emits <i>both</i> checkpoints, even when the read fails, because the spec requires each <code>pre_tool_call</code> to have its matching <code>post_tool_call</code> (§3.1).</p>
+<pre><code>async def load_skill(emitter, builder, read_skill, *, call_id, name, source, version):
+    args = {"name": name, "source": source, "version": version}
+    pre = await emitter.emit(builder.pre_tool_call(call_id=call_id, name=LOADER_TOOL, args=args))
+    args = pre.target                                # args as the checks allowed them
+    try:
+        content = await asyncio.to_thread(read_skill, args)
+        if not isinstance(content, str):
+            raise TypeError("skill content must be text")
+        failed = False
+    except Exception as e:                           # any failed read is a tool error
+        content, failed = f"skill could not be read: {type(e).__name__}", True
+    post = await emitter.emit(builder.post_tool_call(
+        call_id=call_id, name=LOADER_TOOL, args=args, value=content, is_error=failed))
+    if failed:
+        raise LookupError(f"skill {args['name']!r} could not be read")
+    return post.target                               # content as the checks allowed it</code></pre>
+<p class="muted">On a deny, <code>emitter.emit</code> raises <code>InterceptionBlocked</code>. A failed read raises <code>LookupError</code>. The agent loop catches both and tells the model the skill wasn't loaded and why.</p>
+
+<h2>4. What the guard decides</h2>
+<table>
+  <thead><tr><th>Checkpoint</th><th>If…</th><th>Verdict</th></tr></thead>
+  <tbody>
+    <tr><td>either</td><td>the tool isn't <code>load_skill</code></td><td><span class="tag ok">allow</span></td></tr>
+    <tr><td>either</td><td>the name isn't a lowercase slug (<code>[a-z0-9][a-z0-9._-]{0,63}</code>)</td><td><span class="tag bad">deny</span> <code>skill_guard:invalid_name</code></td></tr>
+    <tr><td>either</td><td>the name is on the blocklist</td><td><span class="tag bad">deny</span> <code>skill_guard:blocked</code></td></tr>
+    <tr><td>either</td><td>the source isn't trusted</td><td><span class="tag bad">deny</span> <code>skill_guard:untrusted_source</code></td></tr>
+    <tr><td><code>pre_tool_call</code></td><td>the skill isn't on the allowlist</td><td><span class="tag warn">liftable deny</span> <code>skill_guard:unreviewed</code></td></tr>
+    <tr><td><code>post_tool_call</code></td><td>the read itself failed</td><td><span class="tag ok">allow</span> (nothing was loaded)</td></tr>
+    <tr><td><code>post_tool_call</code></td><td>the content isn't text</td><td><span class="tag bad">deny</span> <code>skill_guard:malformed</code></td></tr>
+    <tr><td><code>post_tool_call</code></td><td>it's bigger than <code>max_bytes</code></td><td><span class="tag bad">deny</span> <code>skill_guard:too_large</code></td></tr>
+    <tr><td><code>post_tool_call</code></td><td>its SHA-256 doesn't match the pin</td><td><span class="tag bad">deny</span> <code>skill_guard:tampered</code></td></tr>
+    <tr><td><code>post_tool_call</code></td><td>it contains a forbidden pattern</td><td><span class="tag bad">deny</span> <code>skill_guard:content_blocked</code></td></tr>
+  </tbody>
+</table>
+<p>The first four rows run at <i>both</i> checkpoints. At <code>post_tool_call</code> they re-check the arguments the loader <i>actually used</i>, so another control (or an approver) that rewrites the name or source can't swap in a blocked skill. Names are matched exactly and never normalised, so <code>Shell-Anything</code> can't slip past a blocklist entry on a case-insensitive store.</p>
+<p>If the guard itself crashes, times out or returns garbage, the SDK turns that into a deny (<code>host_error:interceptor_failed</code> and similar). A broken guard never lets a skill through.</p>
+
+<h2>5. The contract rules we relied on</h2>
+<table>
+  <thead><tr><th>Rule (spec 0.1)</th><th>How the design uses it</th></tr></thead>
+  <tbody>
+    <tr><td>§3: the checkpoint set is closed</td><td>Why we reuse the tool checkpoints instead of adding one.</td></tr>
+    <tr><td>§3.1: each pre has exactly one post</td><td><code>load_skill</code> emits the post checkpoint even when the read fails.</td></tr>
+    <tr><td>§6.1 / §6.2: deny before vs after</td><td>A deny before means the skill is never read; a deny after means the text is discarded.</td></tr>
+    <tr><td>§6.3: failures deny</td><td>Under 0.1 there is no knob: a crashed or hung guard always blocks.</td></tr>
+    <tr><td>§7.7.5: resolvers validate and never echo config</td><td>Strict config checks; error messages name keys only.</td></tr>
+    <tr><td>§9: approval echoes the fingerprint</td><td>The approver sees the exact skill args, and the approval is bound to them.</td></tr>
+    <tr><td>§10.2: fingerprint covers <code>tool_call.args</code> and <code>tool_result.value</code></td><td>Skill name, source and version go in <code>args</code>, not in <code>extensions</code> (which the fingerprint ignores).</td></tr>
+    <tr><td>§10.3: records carry no payload</td><td>The audit record shows the verdict but never the skill text (a test checks this).</td></tr>
+  </tbody>
+</table>
+
+<h2>6. How it's tested</h2>
+<p>The test file <code>sdk/python/tests/test_skill_guard.py</code> doesn't keep its own copy of the guard. It pulls the Python block out of the docs page and runs that exact code, through a real emitter built from a real declaration. If someone edits the page and breaks it, the test fails.</p>
+<div id="tests-section">
+<p>102 test cases from 19 test functions. Parametrized functions run one case per row.</p>
+<table>
+  <thead><tr><th>Test</th><th>Cases</th><th>What it proves</th></tr></thead>
+  <tbody>
+    <tr><td>page declaration loads with page registry</td><td>1</td><td>The JSON and registry code on the page load together, and every lifecycle and model point is allowed (the passthrough works).</td></tr>
+    <tr><td>reviewed skill loads</td><td>1</td><td>Happy path; the reader gets the expected args.</td></tr>
+    <tr><td>plain deny before load</td><td>22</td><td>11 bad names/sources, each with and without an approver: never read, never lifted, approver never asked.</td></tr>
+    <tr><td>unreviewed: liftable, lifted, rejected</td><td>3</td><td>Approval block present; no approver means denied; approve loads; reject stays denied.</td></tr>
+    <tr><td>approved skill is still checked after load</td><td>3</td><td>Oversized, multibyte-oversized and forbidden-pattern content is discarded even after approval.</td></tr>
+    <tr><td>approver rewrites the name to a blocked skill</td><td>1</td><td>Caught at gate 2 (review finding 5).</td></tr>
+    <tr><td>content checks after load</td><td>10</td><td>Tampered, trailing space, at/over the byte limit (ASCII and multibyte), forbidden pattern, empty, unpinned, pinned.</td></tr>
+    <tr><td>guard denies non-text content</td><td>4</td><td>None, list, dict, int give <code>malformed</code>.</td></tr>
+    <tr><td>loader reports non-text as a failed read</td><td>5</td><td>None, list, dict, int, bytes: <code>LookupError</code>, post still emitted.</td></tr>
+    <tr><td>other tools pass through</td><td>12</td><td>Both checkpoints × ok/error result × three look-alike tool names.</td></tr>
+    <tr><td>any failed read still emits post</td><td>6</td><td>Six exception types; nothing from the message reaches a record.</td></tr>
+    <tr><td>broken guard fails closed / hung guard times out</td><td>2</td><td><code>interceptor_failed</code>; <code>interceptor_timeout</code> with <code>timeout_ms</code> honoured (review finding 4).</td></tr>
+    <tr><td>records carry no skill content</td><td>2</td><td>Loaded and denied.</td></tr>
+    <tr><td>page record matches a real record; empty config loads nothing</td><td>2</td><td>The page's example is real; defaults fail closed.</td></tr>
+    <tr><td>bad config or points refuse the document</td><td>28</td><td>Unknown keys, bad pins, bad names, bad limits, wrong types, block+allow overlap, one-point and extra-point bindings: all <code>binding_rejected</code>, and no secret value is echoed.</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2>7. What the review and the end-to-end run found</h2>
+<p>We gave a subagent only the changed files and the contract, and asked it to find faults. A second subagent ran the page's code as written in a fake agent session (21 records) with real skill files. The end-to-end run confirmed every row of the original verdict table, so most findings were gaps beyond it. We re-checked the surprising ones ourselves before changing anything.</p>
+<table>
+  <thead><tr><th>#</th><th>Finding</th><th>Fix</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td><span class="tag bad">bug</span> A binding at only one tool point was accepted, silently disabling half the guard.</td><td>Resolver requires exactly both points.</td></tr>
+    <tr><td>2</td><td><span class="tag bad">bug</span> A <code>loader_tool</code> config key (or a typo in it) turned the guard off.</td><td>Key removed; the tool name is a constant.</td></tr>
+    <tr><td>3</td><td><span class="tag bad">bug</span> Only <code>OSError</code> was caught, so other read errors skipped the post checkpoint; <code>bytes</code> content crashed the emitter.</td><td>Any exception, and non-text content, becomes a failed read with only the type name.</td></tr>
+    <tr><td>4</td><td><span class="tag bad">bug</span> The timeout never fired: the async guard never awaited, so it could not be interrupted.</td><td>Checks run via <code>asyncio.to_thread</code>; a test proves the timeout.</td></tr>
+    <tr><td>5</td><td><span class="tag bad">bug</span> The post check ignored the name/source actually used, so another control's or an approver's rewrite could swap in a blocked skill.</td><td>Name and source are re-checked at both points; approval-skips-later-controls documented with the <code>resume</code> knob.</td></tr>
+    <tr><td>6</td><td><span class="tag bad">bug</span> <code>Shell-Anything</code> got only a liftable deny, not <code>blocked</code>.</td><td>Strict name grammar; anything else is a plain <code>invalid_name</code> deny, also in config.</td></tr>
+    <tr><td>7</td><td><span class="tag warn">doc</span> Claimed contexts over 5 MiB are denied by default. The SDK enforces no size bound (also seen in the end-to-end run).</td><td>Claim replaced: host must bound the read; <code>max_bytes</code> capped at 1 MiB.</td></tr>
+    <tr><td>8</td><td><span class="tag warn">doc</span> Told readers to keep <code>on_error: deny</code>, a member declaration 1.0 refuses.</td><td>Sentence removed.</td></tr>
+    <tr><td>9</td><td><span class="tag warn">doc</span> The declaration omitted model calls, so a real agent's model calls would all be denied.</td><td>Surface and passthrough now include the model points; a test emits them.</td></tr>
+    <tr><td>10</td><td><span class="tag warn">doc</span> Overstated approval binding: the approver sees name, source and version, not the content.</td><td>Stated plainly; pin skills once reviewed.</td></tr>
+    <tr><td>11</td><td><span class="tag info">nit</span> Misleading config error message; digest and pattern caveats; sync read blocking the event loop.</td><td>Message reworded; caveats added; read moved to a thread.</td></tr>
+    <tr><td>12</td><td><span class="tag info">tests</span> Mutations such as <code>len(content)</code> for bytes or <code>&gt;=</code> for <code>&gt;</code> passed all 23 old tests.</td><td>Parametrized boundary, multibyte and approval cases (102 now).</td></tr>
+  </tbody>
+</table>
+<p class="muted">One check from the original end-to-end script now "fails" on purpose: it asserted the false 5 MiB claim. What it observed (the guard runs and denies the oversized skill as <code>too_large</code>) is what the corrected page says. Still open: lifting the guard's deny skips later controls under the default profile, and the SDK cannot serialise <code>bytes</code> into a context. Both are documented, not changed here.</p>
+
+<h2>8. Regression checks</h2>
+<div id="regression-section">
+<table>
+  <thead><tr><th>Check</th><th>Result</th></tr></thead>
+  <tbody>
+    <tr><td>Full Python suite before the change</td><td>350 passed, 23 skipped</td></tr>
+    <tr><td>Full Python suite after the fixes</td><td><span class="tag ok">pass</span> 452 passed, 23 skipped (+102 new tests, same skips)</td></tr>
+    <tr><td>Same suite on Python 3.11, 3.12 and 3.14</td><td><span class="tag ok">pass</span> 452 passed on each</td></tr>
+    <tr><td>New tests with the CTK pytest plugin enabled</td><td><span class="tag ok">pass</span> 102 passed</td></tr>
+    <tr><td><code>ruff format --check</code> + <code>ruff check</code> (CI's commands), and on the page's code</td><td><span class="tag ok">pass</span></td></tr>
+    <tr><td>CI lint job's Python scripts: version consistency, spec folders, 85 script tests, file headers (159 files)</td><td><span class="tag ok">pass</span></td></tr>
+    <tr><td>Docs site: <code>mkdocs build --strict</code> with the pinned mkdocs-material 9.6.23</td><td><span class="tag ok">pass</span></td></tr>
+    <tr><td>End-to-end session rerun on the fixed page</td><td><span class="tag ok">45/46</span> the 46th asserts the removed 5 MiB claim (see section 7)</td></tr>
+    <tr><td>Rust, TypeScript, Go, .NET, spec, schemas, vectors</td><td>Not touched by this change</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2>9. Cost</h2>
+<p>Let <b>n</b> be the size of the skill text. Gate 1 is a few set lookups (constant time). Gate 2 encodes the text once, hashes it when a digest is pinned, folds its case once, and scans it once per forbidden pattern, so it is linear in <b>n</b> for a short pattern list (<b>O(n·p)</b> for <b>p</b> patterns; a multi-pattern matcher such as Aho-Corasick brings it to one pass). The checks run in a worker thread, so the timeout works, but a timed-out check is abandoned rather than killed, which is why <code>max_bytes</code> is capped at 1 MiB. The SDK already pays O(n) per checkpoint to fingerprint and copy the context. Memory is O(n) for one skill at a time.</p>
+
+<h2>10. What the host still has to do</h2>
+<ul>
+  <li><b>One door only.</b> Every skill must come in through <code>load_skill</code>. The spec doesn't promise complete mediation, so a second route would bypass the guard.</li>
+  <li><b>Bound the read.</b> The SDK does not enforce the recommended 5 MiB context bound, so have <code>read_skill</code> stop at <code>max_bytes + 1</code> bytes.</li>
+  <li><b>Bind something at the other checkpoints</b>, including the model ones, or enforce mode denies them all.</li>
+  <li><b>If other controls follow the guard</b>, set <code>composition.on_approval</code> to <code>resume</code>; otherwise lifting the guard's deny skips them.</li>
+  <li><b>Load on first use.</b> Hosts that preload skills still call <code>load_skill</code> for each one, after startup has been allowed.</li>
+  <li><b>Treat patterns as a tripwire</b> and pin digests for skills that matter.</li>
+</ul>
+
+<footer>Files: <code>docs-site/docs/examples/skill-guard.md</code> (new) · <code>docs-site/mkdocs.yml</code> (+1 line) · <code>sdk/python/tests/test_skill_guard.py</code> (new). Nothing committed.</footer>
+</main>
+
+<script>
+  // For each scenario: the state of every step, plus the final outcome.
+  // run = executes and allows, deny = stops here, lift = approver lifts, skip = never reached.
+  const S = {
+    reviewed:   { ask:"run", pre:"run", g1:"run",  appr:"skip", read:"run",  post:"run",  g2:"run",  use:"run",
+                  out:["ok",  "Loaded. Both gates allowed; the skill text enters the agent's context."] },
+    blocked:    { ask:"run", pre:"run", g1:"deny", appr:"skip", read:"skip", post:"skip", g2:"skip", use:"skip",
+                  out:["bad", "Blocked before reading: deny skill_guard:blocked. The skill file is never opened."] },
+    unreviewed: { ask:"run", pre:"run", g1:"deny", appr:"skip", read:"skip", post:"skip", g2:"skip", use:"skip",
+                  out:["bad", "Blocked: a liftable deny (skill_guard:unreviewed), but no approver is registered, so it stays a deny."] },
+    approved:   { ask:"run", pre:"run", g1:"lift", appr:"lift", read:"run",  post:"run",  g2:"run",  use:"run",
+                  out:["ok",  "Loaded after approval. The record says resolved_by: approval. Gate 2 still checks the content."] },
+    tampered:   { ask:"run", pre:"run", g1:"run",  appr:"skip", read:"run",  post:"run",  g2:"deny", use:"skip",
+                  out:["bad", "Blocked after reading: deny skill_guard:tampered. The host discards the text."] },
+    rewrite:    { ask:"run", pre:"run", g1:"lift", appr:"lift", read:"run",  post:"run",  g2:"deny", use:"skip",
+                  out:["bad", "Caught after reading: the approver's rewrite swapped in a blocked name. Gate 2 re-checks the arguments actually used (skill_guard:blocked) and the host discards the text."] },
+    crash:      { ask:"run", pre:"run", g1:"deny", appr:"skip", read:"skip", post:"skip", g2:"skip", use:"skip",
+                  out:["bad", "Fails closed: the SDK turns the crash into deny host_error:interceptor_failed."] },
+  };
+  const LABEL = { run:"runs", deny:"DENY", lift:"approval", skip:"skipped" };
+  function show(name) {
+    const s = S[name];
+    document.querySelectorAll("#flow .step").forEach(el => {
+      const st = s[el.dataset.k];
+      el.classList.remove("run", "deny", "lift", "skip");
+      el.classList.add(st);
+      el.querySelector(".state").textContent = LABEL[st];
+    });
+    const out = document.getElementById("outcome");
+    out.className = "outcome " + s.out[0];
+    out.textContent = s.out[1];
+    document.querySelectorAll(".scenarios button").forEach(b =>
+      b.setAttribute("aria-pressed", String(b.dataset.s === name)));
+  }
+  document.querySelectorAll(".scenarios button").forEach(b => b.addEventListener("click", () => show(b.dataset.s)));
+  show("reviewed");
+</script>
+</body>
+</html>

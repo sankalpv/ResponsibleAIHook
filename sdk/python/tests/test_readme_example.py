@@ -26,7 +26,7 @@ from agent_hooks import (
 )
 from agent_hooks.context import AgentContext
 
-_README = pathlib.Path(__file__).resolve().parents[3] / "README.md"
+_README = pathlib.Path(__file__).resolve().parents[3] / "UPSTREAM-README.md"
 
 pytestmark = pytest.mark.skipif(not _README.is_file(), reason="repository README not present")
 

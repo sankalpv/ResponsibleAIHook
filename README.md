@@ -1,284 +1,263 @@
-# agent-hooks
+# ResponsibleAIHook: checking every skill an agent loads
 
-> Status: Beta. Spec: the SDKs support two specification versions,
-> [0.1](spec/0.1/AGENT-HOOKS-0.1.md), the released specification, wire
-> string `agent-hooks/0.1`, and the [draft](spec/draft/AGENT-HOOKS-DRAFT.md),
-> wire string `agent-hooks/draft`, which changes without notice and is
-> never claimed. A host names the version it emits; there is no default.
-> Host declaration contract: `agent-hooks-declaration/1.1` under the draft,
-> `1.0` under 0.1 ([version table](spec/draft/DECLARATION-VERSIONS.md)).
+This repository adds a **skill-load guard** to Microsoft's
+[agent-hooks](https://github.com/responsibleai/agent-hooks), the open
+interception contract between an agent host and the controls that govern
+it. The guard runs checks on every skill an agent loads, using only the
+hook contract that already exists. Nothing in the spec, the Rust core or
+the SDK APIs changed.
 
-Agent Hooks is the interception contract between an agent host and the
-controls that govern it. It fixes eight points in the agent loop, the
-context the host hands over at each, the verdict a control returns, and
-what the host must do with that verdict. Any host (a framework, a
-runtime, a gateway) can expose the contract, and any control (a policy
-engine, a content filter, a rate limiter, an approval gateway, an egress
-guard) can target it. Agent Hooks is not a policy engine: it carries no
-rules and makes no decisions of its own. It is not a sandbox: the host
-is trusted, interceptors run in-process with full data access, and the
-eight points do not promise complete mediation. It is a control plane,
-not a telemetry plane: every verdict binds the host, and passive
-observation is out of scope. See [SECURITY.md](SECURITY.md) and
-[spec §1.4](spec/0.1/AGENT-HOOKS-0.1.md#14-trust-model-and-non-goals).
+> An interactive version of this page, with a clickable walk-through of
+> each scenario, is in [docs/skill-guard-explainer.html](docs/skill-guard-explainer.html).
+> GitHub shows HTML files as source, so download it and open it in a browser.
+> The upstream project's own README is kept as [UPSTREAM-README.md](UPSTREAM-README.md).
 
-## Points and verdicts
+## In one paragraph
 
-| Interception point | When | Target a `transform` may rewrite |
-| --- | --- | --- |
-| `agent_startup` | Once, before the first input of a session | none |
-| `input` | Each external request entering the session | `input` |
-| `pre_model_call` | Before each model request | `messages` |
-| `post_model_call` | After each model response | `response` |
-| `pre_tool_call` | Before each tool invocation | `tool_call.args` |
-| `post_tool_call` | After each tool invocation | `tool_result.value` |
-| `output` | Before the final response leaves | `output` |
-| `agent_shutdown` | Once, at the end of the session | none |
+agent-hooks has 8 fixed checkpoints, and a host may not invent a ninth.
+So there is no "skill load" checkpoint. Instead, the host loads every
+skill through one function, `load_skill`, which it reports as a tool call.
+That puts each skill load between two checkpoints that already exist:
+`pre_tool_call` (before the skill is read) and `post_tool_call` (after it
+is read, before the agent sees it). A new binding kind,
+`com.example.skill-guard`, sits at those two checkpoints and returns
+allow or deny.
 
-| Verdict | Host obligation |
+What was added:
+
+| File | What it is |
 | --- | --- |
-| `allow` | Proceed. Record any warnings the verdict carries. |
-| `transform` | Apply the rewrite to the target, then proceed with the new value. |
-| `deny` | Do not proceed. A deny that carries an `approval` block is liftable through the approval seam (§9); until lifted it is a deny. |
+| [docs-site/docs/examples/skill-guard.md](docs-site/docs/examples/skill-guard.md) | The guard, its kind resolver, the loader, the declaration and the verdict table |
+| [sdk/python/tests/test_skill_guard.py](sdk/python/tests/test_skill_guard.py) | 102 test cases that run the page's code as written |
+| [docs-site/mkdocs.yml](docs-site/mkdocs.yml) | One nav line for the new page |
 
-Warnings ride on any verdict. A host that cannot build a valid context,
-or whose interceptor raises, times out or returns an invalid verdict,
-denies with a reserved `host_error:*` reason (§6.3, §11). Zero
-registered interceptors in `enforce` mode denies too (§7). An
-administrator can mark one binding best effort with
-`on_error: continue` (§6.3.1): the three interceptor failures then
-substitute an allow that carries `host_warning:control_failed`, the
-record keeps the cause in `substituted_for`, and the host tells the
-principal. The default is `deny` everywhere and nothing else has a
-knob.
+## 1. The problem and the constraint
 
-The decided [P-006](docs/proposals/P-006-interceptor-response-envelope.md)
-adds an optional response envelope for hosted transports:
+A **skill** is a packaged set of instructions (often a `SKILL.md` file)
+that an agent pulls into its context when it needs it. That makes it a way
+in for untrusted instructions. The gate should block a skill based on
+*which* skill it is, *where* it came from, and *what* it contains.
 
-```json
-{ "verdict": { "decision": "allow" }, "extensions": { "provider": { "receipt": {} } } }
-```
+- **Rejected: a new `skill_load` checkpoint.** The spec says (section 3)
+  that the set of points is closed, so a ninth point would mean changing
+  the spec, the schemas, all five SDKs, the conformance vectors and the
+  declaration format.
+- **Chosen: treat a skill load as a tool call.** `docs/INTEROP.md` already
+  uses this approach for MCP resource reads. A tool call gets a *before*
+  and an *after* checkpoint, which are exactly the two gates needed.
 
-`Verdict` remains closed. The SDKs carry an interceptor-response parser that
-accepts either a bare Verdict or this envelope; only the nested Verdict participates in
-enforcement. The envelope is part of the 0.1 contract.
+## 2. What happens on a skill load
 
-## Adopting it as a host
+1. The agent asks for a skill (the model, a user command, or the host).
+2. `load_skill` emits `pre_tool_call` with the tool name `load_skill` and
+   the arguments `{name, source, version}`.
+3. **Gate 1, which skill and where from.** Valid name, then blocklist,
+   then trusted source, then reviewed (allowlist).
+4. A skill that is not on the allowlist gets a deny that a registered
+   approver can lift. With no approver, it stays a deny.
+5. The host reads the skill, only after gate 1 allows. A read error still
+   emits step 6, as an error result.
+6. `load_skill` emits `post_tool_call` with the skill text as the result.
+7. **Gate 2, what the skill contains.** Re-check name and source, then
+   text only, size limit, pinned SHA-256, forbidden patterns.
+8. The skill enters the agent's context. This is the only way in. A deny
+   at step 7 means the host throws the text away.
 
-A host builds one emitter, registers interceptors with it, and emits a
-context at each point. There are three ways to build the emitter, and
-they produce the same emitter and the same records:
+## 3. The pieces
 
-1. From a host declaration file.
-2. From the declaration as JSON text or a parsed value.
-3. In code, through a declaration builder; its value goes through the
-   same loader.
+Everything is in
+[skill-guard.md](docs-site/docs/examples/skill-guard.md). It follows the
+same pattern as every other control in agent-hooks: **binding, kind
+resolver, interceptor, verdict**.
 
-The constructor and setters still work and stay conformant. That path
-carries no declaration, is not sealed, and its records are unchanged.
-
-The host declaration (spec §7.7) is one JSON document that states the
-host's configuration, its declared surface and its interceptor
-bindings. It is a versioned contract of its own, separate from the wire
-version and from package versions: 0.1 defines
-`agent-hooks-declaration/1.0`, and the SDKs also accept the draft's 1.1,
-which adds the failure posture. The document names the specification
-version it is written for in `spec` (`agent-hooks/0.1` or
-`agent-hooks/draft`); the SDKs require that member under both
-versions, so a document written for 0.1 without it is refused and
-needs that one line added. Enterprise settings channels can carry it
-unchanged.
+**The binding** (in the host's declaration file) says what to call, where,
+and with what settings:
 
 ```json
 {
-  "$schema": "https://responsibleai.github.io/agent-hooks/schema/v0.1/host-declaration-1.0.schema.json",
-  "declaration": "agent-hooks-declaration/1.0",
-  "spec": "agent-hooks/0.1",
-  "id": "prod-eu-strict",
-  "host": { "name": "example-runtime", "version": "3.2.0" },
-  "configuration": {
-    "mode": "enforce",
-    "composition": { "profile": "parallel/unanimous", "on_disagreement": "approval" },
-    "identity_provider": "jcs-sha256",
-    "approval": { "resolver": "operator-queue", "redactor": "strip-secrets" },
-    "posture": { "tool_seam_host_error": "continue" },
-    "timeouts": { "interceptor_ms": 5000, "approval_resolver_ms": 30000 },
-    "records": { "max_buffered": 10000 }
-  },
-  "surface": {
-    "interception_points": [
-      "agent_startup", "input", "pre_model_call", "post_model_call",
-      "pre_tool_call", "post_tool_call", "output", "agent_shutdown"
-    ],
-    "capabilities": ["model_calls", "tool_calls", "int64_json", "host_declaration"],
-    "profiles": {
-      "sequential/first_deny": { "on_approval": ["stop", "resume"] },
-      "sequential/run_all": {},
-      "parallel/strictest": { "on_transform_conflict": ["deny", "approval"] },
-      "parallel/unanimous": { "on_disagreement": ["deny", "approval"] }
-    },
-    "buffered_output": true,
-    "declaration_versions": ["agent-hooks-declaration/1.0", "agent-hooks-declaration/1.1"]
-  },
-  "bindings": [
-    {
-      "id": "egress-guard",
-      "kind": "com.example.egress",
-      "at": ["pre_tool_call", "output"],
-      "config": { "allow_hosts": ["internal.example"] },
-      "timeout_ms": 2000
-    },
-    { "id": "audit", "kind": "com.example.audit-log", "config": { "sink": "stdout" } }
-  ]
+  "id": "skill-guard",
+  "kind": "com.example.skill-guard",
+  "at": ["pre_tool_call", "post_tool_call"],
+  "timeout_ms": 2000,
+  "config": {
+    "trusted_sources": ["internal-registry"],
+    "allow": { "pdf-tools": "sha256:c01c…a078", "sql-helper": null },
+    "block": ["shell-anything"],
+    "max_bytes": 262144,
+    "forbidden_patterns": ["curl | sh", "ignore previous instructions"]
+  }
 }
 ```
 
-Only `declaration` and `bindings` are required. Every other member
-defaults to the value the spec already names, and every default fails
-closed. A binding is a `kind` plus a kind-specific `config`. The kind
-is a lookup key the host controls; the spec defines no kinds and names
-no product. The host registers a resolver per kind in code, along with
-any custom identity provider, approval resolver or redactor the
-document may name, and the surface its code supports:
+`allow` pins each reviewed skill to the SHA-256 of its content; `null`
+means any content that passes the other checks. An explicit allow-all
+binding covers the other checkpoints, including the two model ones,
+because in enforce mode a checkpoint with nothing bound denies everything
+(`host_error:no_interceptor`).
 
-```python
-from agent_hooks import HostRegistry, HostSurface, InterceptionEmitter
+**The kind resolver** (`resolve_skill_guard`) runs once, when the
+declaration loads. It checks every config key and refuses anything it does
+not understand, which rejects the whole file before any agent runs. Its
+messages name keys, never values, because config can hold secrets. It also
+refuses any binding that is not on exactly both tool checkpoints, since
+bound at only one, half the guard would silently do nothing.
 
-registry = (
-    HostRegistry(
-        HostSurface.from_capabilities(
-            ["model_calls", "tool_calls", "int64_json", "host_declaration"]
-        )
-    )
-    .kind("com.example.egress", lambda config, ctx: EgressGuard(**config))
-    .kind("com.example.audit-log", lambda config, ctx: AuditLog(**config))
-    .approval_resolver("operator-queue", OperatorQueue())
-    .approval_redactor("strip-secrets", strip_secrets)
-)
-emitter = InterceptionEmitter.from_declaration_path("agent-hooks.declaration.json", registry)
+**The interceptor** (`SkillGuard.intercept`) ignores every tool that is not
+`load_skill`. Its checks run in a worker thread so the SDK's timeout can
+fire; that timeout can only interrupt an interceptor at an `await`.
+
+**The host gateway** (`load_skill`) is the single route every skill takes
+into the agent. It always emits *both* checkpoints, even when the read
+fails, because each `pre_tool_call` must have its matching
+`post_tool_call` (spec section 3.1). A deny raises `InterceptionBlocked`; a
+failed read raises `LookupError`.
+
+## 4. What the guard decides
+
+| Checkpoint | If | Verdict |
+| --- | --- | --- |
+| either | the tool is not `load_skill` | allow |
+| either | the name is not a lowercase slug (`[a-z0-9][a-z0-9._-]{0,63}`) | deny `skill_guard:invalid_name` |
+| either | the name is on the blocklist | deny `skill_guard:blocked` |
+| either | the source is not trusted | deny `skill_guard:untrusted_source` |
+| `pre_tool_call` | the skill is not on the allowlist | liftable deny `skill_guard:unreviewed` |
+| `post_tool_call` | the read itself failed | allow (nothing was loaded) |
+| `post_tool_call` | the content is not text | deny `skill_guard:malformed` |
+| `post_tool_call` | it is bigger than `max_bytes` | deny `skill_guard:too_large` |
+| `post_tool_call` | its SHA-256 does not match the pin | deny `skill_guard:tampered` |
+| `post_tool_call` | it contains a forbidden pattern | deny `skill_guard:content_blocked` |
+
+The first four rows run at **both** checkpoints. At `post_tool_call` they
+re-check the arguments the loader *actually used*, so another control or
+an approver that rewrites the name or source cannot swap in a blocked
+skill. Names are matched exactly and never normalised, so `Shell-Anything`
+cannot slip past a blocklist entry on a case-insensitive store.
+
+If the guard itself crashes, times out or returns garbage, the SDK turns
+that into a deny (`host_error:interceptor_failed` and similar). A broken
+guard never lets a skill through.
+
+## 5. The contract rules the design relies on
+
+| Rule (spec 0.1) | How the design uses it |
+| --- | --- |
+| Section 3: the checkpoint set is closed | Why the tool checkpoints are reused instead of adding one |
+| Section 3.1: each pre has exactly one post | `load_skill` emits the post checkpoint even when the read fails |
+| Sections 6.1 and 6.2: deny before vs after | A deny before means the skill is never read; a deny after means the text is discarded |
+| Section 6.3: failures deny | Under 0.1 there is no knob: a crashed or hung guard always blocks |
+| Section 7.7.5: resolvers validate and never echo config | Strict config checks; error messages name keys only |
+| Section 9: approval echoes the fingerprint | The approver sees the exact skill arguments, and the approval is bound to them |
+| Section 10.2: the fingerprint covers `tool_call.args` and `tool_result.value` | Skill name, source and version go in `args`, not in `extensions` |
+| Section 10.3: records carry no payload | The audit record shows the verdict but never the skill text (a test checks this) |
+
+## 6. How it is tested
+
+`sdk/python/tests/test_skill_guard.py` does not keep its own copy of the
+guard. It pulls the Python block out of the docs page and runs that exact
+code through a real emitter built from a real declaration, so editing the
+page in a way that breaks it fails the test.
+
+102 test cases from 19 test functions:
+
+| Test | Cases | What it proves |
+| --- | --- | --- |
+| page declaration loads with page registry | 1 | The JSON and registry code on the page load together, and every lifecycle and model point is allowed |
+| reviewed skill loads | 1 | Happy path |
+| plain deny before load | 22 | 11 bad names or sources, each with and without an approver: never read, never lifted, approver never asked |
+| unreviewed: liftable, lifted, rejected | 3 | Approval block present; no approver means denied; approve loads; reject stays denied |
+| approved skill is still checked after load | 3 | Oversized, multibyte-oversized and forbidden-pattern content is discarded even after approval |
+| approver rewrites the name to a blocked skill | 1 | Caught at gate 2 |
+| content checks after load | 10 | Tampered, trailing space, at and over the byte limit (ASCII and multibyte), forbidden pattern, empty, unpinned, pinned |
+| guard denies non-text content | 4 | `malformed` |
+| loader reports non-text as a failed read | 5 | `LookupError`, post still emitted |
+| other tools pass through | 12 | Both checkpoints, ok and error results, three look-alike tool names |
+| any failed read still emits post | 6 | Six exception types; nothing from the message reaches a record |
+| broken guard fails closed; hung guard times out | 2 | `interceptor_failed`; `interceptor_timeout` with `timeout_ms` honoured |
+| records carry no skill content | 2 | Loaded and denied |
+| page record matches a real record; empty config loads nothing | 2 | The page's example is real; defaults fail closed |
+| bad config or points refuse the document | 28 | Unknown keys, bad pins, names and limits, wrong types, block and allow overlap, one-point and extra-point bindings; no secret value is echoed |
+
+## 7. What review and an end-to-end run found
+
+A subagent reviewed the change, and a second ran the page's code as
+written in a fake agent session with real skill files. The end-to-end run
+confirmed every row of the original verdict table, so most findings were
+gaps beyond it. The surprising ones were re-checked before anything was
+changed.
+
+| # | Finding | Fix |
+| --- | --- | --- |
+| 1 | A binding at only one tool point was accepted, silently disabling half the guard | Resolver requires exactly both points |
+| 2 | A `loader_tool` config key (or a typo in it) turned the guard off | Key removed; the tool name is a constant |
+| 3 | Only `OSError` was caught, so other read errors skipped the post checkpoint; `bytes` content crashed the emitter | Any exception, and non-text content, becomes a failed read with only the type name |
+| 4 | The timeout never fired: the async guard never awaited | Checks run via `asyncio.to_thread`; a test proves the timeout |
+| 5 | The post check ignored the name and source actually used, so a rewrite by another control or an approver could swap in a blocked skill | Name and source are re-checked at both points |
+| 6 | `Shell-Anything` got only a liftable deny, not `blocked` | Strict name grammar; anything else is a plain `invalid_name` deny |
+| 7 | Docs claimed contexts over 5 MiB are denied by default; the SDK enforces no size bound | Claim replaced: the host must bound the read; `max_bytes` capped at 1 MiB |
+| 8 | Docs told readers to keep `on_error: deny`, which declaration 1.0 refuses | Sentence removed |
+| 9 | The declaration omitted model calls, so a real agent's model calls would all be denied | Surface and passthrough now include the model points |
+| 10 | Overstated approval binding: the approver sees name, source and version, not the content | Stated plainly; pin skills once reviewed |
+| 11 | Misleading config error message; digest and pattern caveats; sync read blocking the event loop | Reworded, documented, and moved to a thread |
+| 12 | Mutations such as `len(content)` for bytes or `>=` for `>` passed all 23 original tests | Parametrized boundary, multibyte and approval cases |
+
+Still open, and documented rather than changed: lifting the guard's deny
+skips later controls under the default profile (set
+`composition.on_approval` to `resume` if others follow), and the SDK cannot
+serialise `bytes` into a context.
+
+## 8. Regression checks
+
+| Check | Result |
+| --- | --- |
+| Full Python suite before the change | 350 passed, 23 skipped |
+| Full Python suite after the fixes | 452 passed, 23 skipped (102 new tests, same skips) |
+| Same suite on Python 3.11, 3.12 and 3.14 | 452 passed on each |
+| `ruff format --check` and `ruff check` (CI's commands) | pass |
+| CI lint scripts: version consistency, spec folders, 85 script tests, file headers | pass |
+| Docs site: `mkdocs build --strict` | pass |
+| Rust, TypeScript, Go, .NET, spec, schemas, vectors | not touched |
+
+## 9. Cost
+
+Let *n* be the size of the skill text. Gate 1 is a few set lookups
+(constant time). Gate 2 encodes the text once, hashes it when a digest is
+pinned, folds its case once, and scans it once per forbidden pattern, so
+it is linear in *n* for a short pattern list (*O(n·p)* for *p* patterns;
+a multi-pattern matcher such as Aho-Corasick brings it to one pass). The
+checks run in a worker thread, so the timeout works, but a timed-out check
+is abandoned rather than killed, which is why `max_bytes` is capped at
+1 MiB. The SDK already pays *O(n)* per checkpoint to fingerprint and copy
+the context. Memory is *O(n)* for one skill at a time.
+
+## 10. What the host still has to do
+
+- **One door only.** Every skill must come in through `load_skill`. The
+  spec does not promise complete mediation, so a second route would
+  bypass the guard.
+- **Bound the read.** The SDK does not enforce the recommended 5 MiB
+  context bound, so have `read_skill` stop at `max_bytes + 1` bytes.
+- **Bind something at the other checkpoints**, including the model ones,
+  or enforce mode denies them all.
+- **If other controls follow the guard**, set `composition.on_approval`
+  to `resume`; otherwise lifting the guard's deny skips them.
+- **Load on first use.** Hosts that preload skills still call
+  `load_skill` for each one, after startup has been allowed.
+- **Treat patterns as a tripwire** and pin digests for skills that matter.
+
+## Running it
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r sdk/python/requirements-dev.lock
+.venv/bin/pip install -e ./sdk/python        # builds the Rust core; needs a Rust toolchain
+.venv/bin/pytest sdk/python/tests -p no:agent_hooks_ctk -m "not draft" -q
 ```
 
-A document that names a point, profile, capability, provider or kind
-the code cannot honour is refused at load, before any emission, with
-one of eleven `declaration_error:*` classes
-([`spec/0.1/declaration-errors.json`](spec/0.1/declaration-errors.json)).
-Nothing is narrowed or applied in part. A loader refuses a version it
-does not accept and names the versions it does. Once built, the emitter
-is sealed, and every record it writes carries the contract version.
-The per-SDK READMEs show the same calls in each language.
+## Attribution and license
 
-## Composition and seams
-
-- Composition profile (§7): `sequential/first_deny` (default),
-  `sequential/run_all`, `parallel/strictest`, `parallel/unanimous`,
-  each with the knobs it consults. The profile in effect is stamped on
-  every record.
-- Approval seam (§9): a liftable deny consults the host's registered
-  resolver; the resolution echoes the context identity, so an approval
-  binds to the content the approver saw. No resolver means the deny
-  stands.
-- Redaction seam (§9): a registered redactor shapes what the approver
-  sees; the identity is computed over the redacted context.
-- Identity provider (§10.1): `jcs-sha256` by default, a named custom
-  provider, or `null` for identity-unbound records.
-- Interception record (§10.3): payload-free by construction, one per
-  emission, with the verdict projection, identities, composition and
-  the declaration version when a declaration built the emitter.
-- Enforcement mode (§8): `enforce`, or `evaluate_only` for records
-  without effect.
-
-A decision runtime behind an interceptor (a policy engine the
-interceptor calls) reports its own failures as ordinary denies under
-its own reason namespace, by convention `runtime_error:<code>`. It
-never uses `host_error:*`: §11 reserves that namespace for verdicts the
-host synthesizes, and §5 validation rejects it from an interceptor.
-
-Everything normative runs once, in the Rust core. The Python,
-TypeScript, .NET and Go SDKs bind it and own only dispatch into host
-code, timeouts and runtime integration. Golden files pin
-byte-identical canonical JSON, context identities and resolved
-declarations across the five.
-
-## Conformance
-
-The Conformance Test Kit under [`conformance/`](conformance/) is the
-test. A host implements the `Harness` interface in one SDK
-([`conformance/HARNESS.md`](conformance/HARNESS.md)), declares its
-surface (points, capabilities, profiles and knob values, identity
-provider, posture), and passes every vector that applies to that
-surface. There are no tiers. The report lists what ran, per part. A
-host may present its surface as a host declaration document, and a
-claim may cite that file. Claims live in
-[`conformance/CLAIMS.md`](conformance/CLAIMS.md). A conformance claim
-is not a security certification. The gating tests run the released
-vectors under 0.1, the newest released version; the 17 draft-only
-vectors, the working test set for the next version, and the tests that
-read draft-only files run in an advisory job. A claim names a released
-version, and every runner refuses a report that names the draft.
-Binding tests to a draft revision is #188.
-
-## Install
-
-| SDK | Install |
-| --- | --- |
-| Rust | `cargo add agent-hooks-sdk` |
-| Python | `pip install --pre agent-hooks-sdk` |
-| TypeScript | `npm install @responsibleai/agent-hooks` |
-| .NET | `dotnet add package ResponsibleAI.AgentHooks --prerelease` |
-| Go | `go get github.com/responsibleai/agent-hooks/sdk/go/agenthooks` |
-
-A plain `npm install` gets the newest release, pre-releases included.
-The channel tags `alpha`, `beta` and `rc` exist for pinning to one
-line, for example `@responsibleai/agent-hooks@beta`; or pin an exact
-version. See [RELEASING.md](RELEASING.md).
-
-The spec is versioned `MAJOR.MINOR`, the declaration contract
-`MAJOR.MINOR`, and the packages by semver, each on its own axis. Every
-SDK supports two specification versions, 0.1 and the draft, and exports
-their wire strings and the supported set: `SPEC_VERSION_0_1`,
-`SPEC_VERSION_DRAFT` and `SUPPORTED_SPEC_VERSIONS` (`["0.1", "draft"]`)
-in Rust, Python and TypeScript; `SpecVersion01`, `SpecVersionDraft` and
-`SupportedSpecVersions` in Go; `Spec.V01`, `Spec.Draft` and
-`Spec.SupportedVersions` in .NET; beside the current declaration version
-and the accepted set (`DECLARATION_VERSION` and
-`SUPPORTED_DECLARATION_VERSIONS`, `DeclarationVersion` and
-`SupportedDeclarationVersions`, `Declaration.Version` and
-`Declaration.SupportedVersions`). A host names the version when it
-builds its emitter and its context builder, or in its host
-declaration's `spec` member; there is no default, and an emitter
-refuses a context of another version. The version named selects the
-rules: `host_warning:*` is reserved, declaration 1.1 is accepted and
-`on_error: continue` exists under the draft only. The draft is never
-claimed. See [VERSIONING.md](VERSIONING.md) and
-[spec/draft/DECLARATION-VERSIONS.md](spec/draft/DECLARATION-VERSIONS.md).
-
-## Read next
-
-- [`spec/README.md`](spec/README.md): specification versions. The
-  released specification is 0.1,
-  [`spec/0.1/AGENT-HOOKS-0.1.md`](spec/0.1/AGENT-HOOKS-0.1.md), the text
-  the SDKs shipped against at `v0.1.0-beta.3`. The draft,
-  [`spec/draft/AGENT-HOOKS-DRAFT.md`](spec/draft/AGENT-HOOKS-DRAFT.md), is
-  the working text and the version `draft` (`agent-hooks/draft`); its
-  [`schema/`](spec/draft/schema/) separates the
-  TypeScript source from the generated JSON Schemas in
-  [`generated/`](spec/draft/schema/generated/).
-- [`docs/IMPLEMENTING.md`](docs/IMPLEMENTING.md): what it means to
-  implement Agent Hooks in a harness or gateway.
-- [`conformance/HARNESS.md`](conformance/HARNESS.md): how to write a
-  harness and run the CTK.
-- [`docs/PRODUCTION.md`](docs/PRODUCTION.md) and
-  [`docs/OPERATIONS.md`](docs/OPERATIONS.md): the decisions to make
-  before production and the runbook after.
-- [`docs/THREAT-MODEL.md`](docs/THREAT-MODEL.md),
-  [`docs/CONTROLS-MAPPING.md`](docs/CONTROLS-MAPPING.md),
-  [`docs/INTEROP.md`](docs/INTEROP.md): threats and mitigations,
-  OWASP and NIST mapping, MCP and A2A interop.
-- [`docs/proposals/`](docs/proposals/): design proposals and the
-  process in [`docs/proposals/README.md`](docs/proposals/README.md).
-- [`GOVERNANCE.md`](GOVERNANCE.md), [`CONTRIBUTING.md`](CONTRIBUTING.md),
-  [`CHANGELOG.md`](CHANGELOG.md).
-
-## License
-
-MIT. See [`LICENSE`](LICENSE).
+This work builds on [responsibleai/agent-hooks](https://github.com/responsibleai/agent-hooks)
+by Microsoft, released under the MIT license; see [LICENSE](LICENSE). The
+upstream project's README is kept unchanged as
+[UPSTREAM-README.md](UPSTREAM-README.md), and the full upstream history is
+preserved in this repository. The skill-guard example and its tests are
+released under the same license.
