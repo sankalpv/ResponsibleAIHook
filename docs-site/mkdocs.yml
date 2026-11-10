@@ -61,6 +61,7 @@ nav:
       - Policy deny: examples/policy-deny.md
       - Human approval: examples/approval-flow.md
       - Redaction transform: examples/redaction.md
+      - Skill load guard: examples/skill-guard.md
   - Conformance: conformance.md
   # scripts/stage-docs-site.py regenerates the Specification entries from
   # the spec/ folders (one per released version, newest first, then the
